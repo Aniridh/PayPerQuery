@@ -143,9 +143,8 @@ export async function fraudGuardAgent(
   // 1. Canonical fingerprint: sha256(lower(merchant)|'|'|dateISO|'|'|amountCents)
   const receiptFingerprint = calculateReceiptFingerprint(merchant, dateISO, amountCents);
 
-  // 2. Duplicate check: block same (fingerprint, wallet)
-  // Use receipt_fingerprint field directly for efficient duplicate detection
-  const exactDuplicate = await prisma.submission.findFirst({
+  // 2a. Same-wallet duplicate: hard block
+  const sameWalletDuplicate = await prisma.submission.findFirst({
     where: {
       wallet: submission.wallet,
       receipt_fingerprint: receiptFingerprint,
@@ -154,8 +153,41 @@ export async function fraudGuardAgent(
     },
   });
 
-  if (exactDuplicate) {
+  if (sameWalletDuplicate) {
     flags.push('duplicate_receipt');
+    riskScore = 1.0;
+    return { riskScore, flags };
+  }
+
+  // 2b. Cross-wallet duplicate: same receipt submitted by ANY wallet → hard block
+  // Prevents receipt farming across multiple wallets
+  const crossWalletDuplicate = await prisma.submission.findFirst({
+    where: {
+      receipt_fingerprint: receiptFingerprint,
+      id: { not: submissionId },
+      wallet: { not: submission.wallet },
+      status: { in: ['APPROVED', 'PAID'] },
+    },
+  });
+
+  if (crossWalletDuplicate) {
+    flags.push('cross_wallet_duplicate');
+    riskScore = 1.0;
+    return { riskScore, flags };
+  }
+
+  // 2c. Content-hash duplicate: same image file submitted by any wallet
+  // Catches byte-identical images even if OCR fields differ
+  const contentHashDuplicate = await prisma.submission.findFirst({
+    where: {
+      content_hash: submission.content_hash,
+      id: { not: submissionId },
+      status: { in: ['APPROVED', 'PAID'] },
+    },
+  });
+
+  if (contentHashDuplicate) {
+    flags.push('content_hash_duplicate');
     riskScore = 1.0;
     return { riskScore, flags };
   }
@@ -197,26 +229,54 @@ export async function fraudGuardAgent(
     }
   }
 
-  // 4. Velocity: approvals per contributor_key ≤3/day
-  // contributor_key = wallet + device_fingerprint + IP /24
-  // For now, we'll use device_fingerprint as a proxy (IP /24 is already in device_fingerprint)
-  const contributorKey = submission.device_fingerprint;
-
+  // 4. Velocity limits (device_fingerprint no longer contains wallet,
+  //    so this correctly rate-limits across all wallets from one device)
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
+  // 4a. Per-device velocity: ≤3 approvals/day across ALL wallets on this device
   const deviceApprovals = await prisma.submission.count({
     where: {
-      device_fingerprint: contributorKey,
+      device_fingerprint: submission.device_fingerprint,
       quest_id: submission.quest_id,
-      status: 'APPROVED',
+      status: { in: ['APPROVED', 'PAID'] },
       created_at: { gte: today },
     },
   });
 
   if (deviceApprovals >= 3) {
-    flags.push('velocity_limit_exceeded');
+    flags.push('device_velocity_exceeded');
+    riskScore = Math.max(riskScore, 0.7);
+  }
+
+  // 4b. Per-wallet velocity: ≤3 approvals/day per wallet (unchanged semantics)
+  const walletApprovals = await prisma.submission.count({
+    where: {
+      wallet: submission.wallet,
+      quest_id: submission.quest_id,
+      status: { in: ['APPROVED', 'PAID'] },
+      created_at: { gte: today },
+    },
+  });
+
+  if (walletApprovals >= 3) {
+    flags.push('wallet_velocity_exceeded');
     riskScore = Math.max(riskScore, 0.5);
+  }
+
+  // 4c. Sybil signal: multiple distinct wallets from same device on same quest
+  const distinctWalletsOnDevice = await prisma.submission.groupBy({
+    by: ['wallet'],
+    where: {
+      device_fingerprint: submission.device_fingerprint,
+      quest_id: submission.quest_id,
+      created_at: { gte: today },
+    },
+  });
+
+  if (distinctWalletsOnDevice.length > 2) {
+    flags.push('sybil_multi_wallet_device');
+    riskScore = Math.max(riskScore, 0.8);
   }
 
   // 5. Quality scoring (if enabled)
