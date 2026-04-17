@@ -4,40 +4,89 @@ import { verifierAgent } from '../agents/verifier';
 import { fraudGuardAgent, calculateReceiptFingerprint } from '../agents/fraud-guard';
 
 const WORKER_INTERVAL_MS = 750; // 500-1000ms range
+const STALE_JOB_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_JOB_ATTEMPTS = 3;
 let isRunning = false;
 let workerInterval: NodeJS.Timeout | null = null;
+let reaperInterval: NodeJS.Timeout | null = null;
 
 /**
- * Claim next job using FOR UPDATE SKIP LOCKED
- * Returns job ID or null if no jobs available
+ * Claim next job using FOR UPDATE SKIP LOCKED.
+ * SELECT + status UPDATE wrapped in a single transaction so the row lock
+ * is held until the status flips to PROCESSING — prevents the race where
+ * two workers both see the same QUEUED row.
  */
 async function claimNextJob(): Promise<{ id: string; type: string; entity_id: string } | null> {
-  // Use raw SQL for FOR UPDATE SKIP LOCKED (Prisma doesn't support this directly)
-  const result = await prisma.$queryRaw<Array<{ id: string; type: string; entity_id: string }>>`
-    SELECT id, type, entity_id
-    FROM "Job"
-    WHERE status = 'QUEUED'
-    ORDER BY created_at ASC
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED
-  `;
+  return prisma.$transaction(async (tx) => {
+    const result = await tx.$queryRaw<Array<{ id: string; type: string; entity_id: string }>>`
+      SELECT id, type, entity_id
+      FROM "Job"
+      WHERE status = 'QUEUED'
+      ORDER BY created_at ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    `;
 
-  if (result.length === 0) {
-    return null;
-  }
+    if (result.length === 0) {
+      return null;
+    }
 
-  const job = result[0];
+    const job = result[0];
 
-  // Update job to PROCESSING
-  await prisma.job.update({
-    where: { id: job.id },
-    data: {
+    await tx.job.update({
+      where: { id: job.id },
+      data: {
+        status: 'PROCESSING',
+        attempts: { increment: 1 },
+      },
+    });
+
+    return job;
+  });
+}
+
+/**
+ * Reap stale jobs stuck in PROCESSING beyond the timeout.
+ * Re-queues if under max attempts, otherwise marks FAILED.
+ */
+async function reapStaleJobs(): Promise<number> {
+  const cutoff = new Date(Date.now() - STALE_JOB_TIMEOUT_MS);
+
+  const staleJobs = await prisma.job.findMany({
+    where: {
       status: 'PROCESSING',
-      attempts: { increment: 1 },
+      updated_at: { lt: cutoff },
     },
   });
 
-  return job;
+  for (const job of staleJobs) {
+    if (job.attempts >= MAX_JOB_ATTEMPTS) {
+      await prisma.job.update({
+        where: { id: job.id },
+        data: {
+          status: 'FAILED',
+          last_error: `Reaped: stuck in PROCESSING for >${STALE_JOB_TIMEOUT_MS / 1000}s after ${job.attempts} attempts`,
+        },
+      });
+
+      // Also mark the associated submission as FAILED so the user isn't stuck
+      await prisma.submission.updateMany({
+        where: { id: job.entity_id, status: { in: ['PENDING', 'QUEUED', 'PROCESSING'] } },
+        data: { status: 'FAILED' },
+      });
+    } else {
+      await prisma.job.update({
+        where: { id: job.id },
+        data: { status: 'QUEUED' },
+      });
+    }
+  }
+
+  if (staleJobs.length > 0) {
+    console.log(`Reaped ${staleJobs.length} stale jobs`);
+  }
+
+  return staleJobs.length;
 }
 
 /**
@@ -97,22 +146,38 @@ async function processVerificationJob(jobId: string, submissionId: string): Prom
       },
     });
 
-    // If approved, enqueue PAYOUT job
+    // If approved, enqueue PAYOUT job — but only if one doesn't already exist
+    // (guards against duplicate VERIFY jobs from the race in scenario 3)
     if (decision === 'APPROVE') {
-      await prisma.job.create({
-        data: {
+      const existingPayoutJob = await prisma.job.findFirst({
+        where: {
           type: 'PAYOUT',
           entity_id: submissionId,
-          status: 'QUEUED',
         },
       });
+
+      if (!existingPayoutJob) {
+        await prisma.job.create({
+          data: {
+            type: 'PAYOUT',
+            entity_id: submissionId,
+            status: 'QUEUED',
+          },
+        });
+      }
     }
 
     // Job completion is handled in processJob
   } catch (error) {
-    // Also update submission status to FAILED on verification failure
-    await prisma.submission.update({
-      where: { id: submissionId },
+    // Mark submission FAILED — but only if it hasn't already advanced to
+    // APPROVED/PAID. Without this guard, a partition between writing the
+    // VerificationResult (APPROVE) and updating Submission (APPROVED)
+    // would cause the catch block to overwrite APPROVED with FAILED.
+    await prisma.submission.updateMany({
+      where: {
+        id: submissionId,
+        status: { in: ['PENDING', 'QUEUED', 'PROCESSING'] },
+      },
       data: {
         status: 'FAILED',
       },
@@ -187,7 +252,7 @@ async function workerTick(): Promise<void> {
       return;
     }
 
-    await processJob(job.id, job.type, job.entity_id);
+    await processJob(job.id, job.type as JobType, job.entity_id);
   } catch (error) {
     console.error('Worker error:', error);
     // Error already handled in processJob, just log here
@@ -197,7 +262,7 @@ async function workerTick(): Promise<void> {
 }
 
 /**
- * Start the worker loop
+ * Start the worker loop and stale-job reaper
  */
 export function startWorker(): void {
   if (workerInterval) {
@@ -206,12 +271,19 @@ export function startWorker(): void {
   }
 
   console.log('Starting worker...');
-  
+
   workerInterval = setInterval(() => {
     workerTick().catch((error) => {
       console.error('Unhandled worker error:', error);
     });
   }, WORKER_INTERVAL_MS);
+
+  // Reaper runs every 60s to reclaim stuck PROCESSING jobs
+  reaperInterval = setInterval(() => {
+    reapStaleJobs().catch((error) => {
+      console.error('Reaper error:', error);
+    });
+  }, 60_000);
 
   // Process immediately on start
   workerTick().catch((error) => {
@@ -220,12 +292,16 @@ export function startWorker(): void {
 }
 
 /**
- * Stop the worker loop
+ * Stop the worker loop and reaper
  */
 export function stopWorker(): void {
   if (workerInterval) {
     clearInterval(workerInterval);
     workerInterval = null;
-    console.log('Worker stopped');
   }
+  if (reaperInterval) {
+    clearInterval(reaperInterval);
+    reaperInterval = null;
+  }
+  console.log('Worker stopped');
 }
