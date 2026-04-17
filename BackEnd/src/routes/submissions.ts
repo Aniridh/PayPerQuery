@@ -65,10 +65,12 @@ router.post('/', upload.single('receipt_image'), async (req, res) => {
     const imageBuffer = fs.readFileSync(req.file.path);
     const contentHash = createHash('sha256').update(imageBuffer).digest('hex');
 
-    // Generate device fingerprint (simplified)
+    // Generate device fingerprint: identifies the DEVICE, not the wallet.
+    // wallet is intentionally excluded so that multiple wallets from the
+    // same device/IP share a single fingerprint for velocity enforcement.
     const userAgent = req.get('user-agent') || '';
     const ip = req.ip || req.socket.remoteAddress || '';
-    
+
     // Handle both IPv4 and IPv6 addresses
     let ipPrefix: string;
     if (ip.includes(':')) {
@@ -79,9 +81,9 @@ router.post('/', upload.single('receipt_image'), async (req, res) => {
       // IPv4: use first 3 octets for /24 prefix
       ipPrefix = ip.split('.').slice(0, 3).join('.');
     }
-    
+
     const deviceFingerprint = createHash('sha256')
-      .update(`${userAgent}|${ipPrefix}|${wallet}`)
+      .update(`${userAgent}|${ipPrefix}`)
       .digest('hex');
 
     // Find or create contributor
@@ -162,10 +164,28 @@ router.get('/:id/status', async (req, res) => {
       );
     }
 
+    // Redact internal decision trace from public endpoint to prevent
+    // predicate oracle attacks (iterative probing to learn rule thresholds).
+    // Full trace remains available via admin debug endpoint.
+    const decision = submission.verification_result?.decision;
+    let publicReason: string | null = null;
+    if (decision === 'REJECT') {
+      // Generic rejection reason — never expose which predicate failed or thresholds
+      const reasons = submission.verification_result?.reasons || [];
+      if (reasons.includes('duplicate_receipt') || reasons.includes('cross_wallet_duplicate') || reasons.includes('content_hash_duplicate')) {
+        publicReason = 'This receipt has already been submitted.';
+      } else if (reasons.some((r: string) => r.includes('velocity'))) {
+        publicReason = 'Submission rate limit reached. Please try again later.';
+      } else {
+        publicReason = 'Submission did not meet quest eligibility requirements.';
+      }
+    }
+
     res.json({
       submission_id: submission.id,
       status: submission.status,
-      trace: submission.verification_result?.trace || null,
+      decision: decision || null,
+      reason: publicReason,
       tx_hash: submission.payout?.tx_hash || null,
       payout_id: submission.payout?.id || null,
       requestId,
